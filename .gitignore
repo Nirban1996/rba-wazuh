@@ -19,3 +19,7 @@ case_store.json
 .DS_Store
 .vscode/
 .idea/
+
+# Secrets
+.env
+
