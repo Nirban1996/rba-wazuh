@@ -23,3 +23,10 @@ case_store.json
 # Secrets
 .env
 
+
+# Local / generated
+*.log
+__pycache__/
+*.pyc
+.env
+case_store.json
