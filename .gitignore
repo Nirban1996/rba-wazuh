@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+.venv/
+venv/
+
+# Logs / runtime output
+*.log
+*.out
+*.pid
+
+# Local data/state (often contains real event data)
+case_store.json
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/

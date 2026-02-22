@@ -1,0 +1,331 @@
+import os
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from dotenv import load_dotenv
+from opensearchpy import OpenSearch
+
+load_dotenv()
+
+# ---- OpenSearch connection ----
+host = os.getenv("OS_HOST")
+port = int(os.getenv("OS_PORT", "9200"))
+user = os.getenv("OS_USER")
+pwd = os.getenv("OS_PASS")
+use_ssl = os.getenv("OS_SSL", "true").lower() == "true"
+verify_certs = os.getenv("OS_VERIFY_CERTS", "false").lower() == "true"
+
+client = OpenSearch(
+    hosts=[{"host": host, "port": port}],
+    http_auth=(user, pwd),
+    use_ssl=use_ssl,
+    verify_certs=verify_certs,
+    ssl_show_warn=False,
+)
+
+STATE_INDEX = "rba-entity-state"
+SNAP_INDEX = "rba-risk-snapshots-*"
+ALERT_INDEX = "rba-alerts-*"
+WAZUH_ALERTS = "wazuh-alerts-*"
+
+st.set_page_config(page_title="RBA Dashboard", layout="wide")
+st.title("Risk-Based Alerting (RBA) Dashboard")
+
+# ---- Controls ----
+colA, colB, colC = st.columns([1, 1, 1])
+with colA:
+    hours = st.selectbox("Time window", [1, 6, 12, 24, 48], index=3)
+with colB:
+    topn = st.selectbox("Top entities", [5, 10, 20], index=1)
+with colC:
+    auto_refresh = st.checkbox("Auto-refresh (manual page refresh)", value=False)
+
+time_gte = f"now-{hours}h"
+
+def count_index(index_pattern: str) -> int:
+    try:
+        resp = client.count(index=index_pattern, body={"query": {"range": {"@timestamp": {"gte": time_gte, "lte": "now"}}}})
+        return int(resp.get("count", 0))
+    except Exception:
+        return 0
+
+def fetch_entity_state(limit=50) -> pd.DataFrame:
+    resp = client.search(
+        index=STATE_INDEX,
+        body={
+            "size": limit,
+            "sort": [{"risk": {"order": "desc"}}],
+            "_source": ["entity.id", "entity.name", "risk", "threshold", "mu", "sigma", "k", "delta_risk", "last_event_ts"],
+            "query": {"match_all": {}},
+        },
+    )
+    rows = []
+    for h in resp["hits"]["hits"]:
+        s = h["_source"]
+        ent = s.get("entity", {})
+        rows.append({
+            "entity_id": ent.get("id"),
+            "entity_name": ent.get("name"),
+            "risk": s.get("risk", 0.0),
+            "threshold": s.get("threshold", 0.0),
+            "mu": s.get("mu", 0.0),
+            "sigma": s.get("sigma", 0.0),
+            "k": s.get("k", 0.0),
+            "delta_risk": s.get("delta_risk", 0.0),
+            "last_event_ts": s.get("last_event_ts"),
+        })
+    return pd.DataFrame(rows)
+
+def fetch_snapshots(entity_id: str, limit=2000) -> pd.DataFrame:
+    resp = client.search(
+        index=SNAP_INDEX,
+        body={
+            "size": limit,
+            "sort": [{"@timestamp": {"order": "asc"}}],
+            "_source": ["@timestamp", "risk", "threshold", "mu", "sigma", "entity.id", "entity.name"],
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"term": {"entity.id": entity_id}},
+                        {"range": {"@timestamp": {"gte": time_gte, "lte": "now"}}},
+                    ]
+                }
+            },
+        },
+    )
+    rows = []
+    for h in resp["hits"]["hits"]:
+        s = h["_source"]
+        ent = s.get("entity", {})
+        rows.append({
+            "ts": s.get("@timestamp"),
+            "risk": s.get("risk", 0.0),
+            "threshold": s.get("threshold", 0.0),
+            "mu": s.get("mu", 0.0),
+            "sigma": s.get("sigma", 0.0),
+            "entity_id": ent.get("id"),
+            "entity_name": ent.get("name"),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    return df
+
+def fetch_rba_alerts(limit=100) -> pd.DataFrame:
+    body = {
+        "size": limit,
+        "sort": [{"@timestamp": {"order": "desc"}}],
+        "_source": [
+            "@timestamp",
+            "entity.id",
+            "entity.name",
+            "risk",
+            "threshold",
+            "delta_risk",
+            "event_count_window",
+            "top_contributors",
+            "contributors_rules",
+            "contributors_rules_window_hours",
+        ],
+        "query": {"range": {"@timestamp": {"gte": time_gte, "lte": "now"}}},
+    }
+
+    resp = client.search(index=ALERT_INDEX, body=body)
+
+    rows = []
+    for h in resp.get("hits", {}).get("hits", []):
+        s = h.get("_source", {}) or {}
+        ent = s.get("entity", {}) or {}
+
+        rows.append({
+            "ts": s.get("@timestamp"),
+            "entity_id": ent.get("id"),
+            "entity_name": ent.get("name"),
+            "risk": s.get("risk", 0.0),
+            "threshold": s.get("threshold", 0.0),
+            "delta_risk": s.get("delta_risk", 0.0),
+            "event_count_window": s.get("event_count_window", 0),
+            "top_contributors": s.get("top_contributors", []),
+            "contributors_rules": s.get("contributors_rules", []),
+            "contributors_rules_window_hours": s.get("contributors_rules_window_hours"),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    return df
+
+def fetch_counts_timeseries(index_pattern: str, interval_minutes: int = 5) -> pd.DataFrame:
+    body = {
+        "size": 0,
+        "query": {"range": {"@timestamp": {"gte": time_gte, "lte": "now"}}},
+        "aggs": {
+            "per_bucket": {
+                "date_histogram": {
+                    "field": "@timestamp",
+                    "fixed_interval": f"{interval_minutes}m"
+                }
+            }
+        },
+    }
+    resp = client.search(index=index_pattern, body=body)
+    buckets = resp["aggregations"]["per_bucket"]["buckets"]
+    rows = [{"ts": b["key_as_string"], "count": b["doc_count"]} for b in buckets]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    return df
+
+# ---- KPI Row ----
+raw_count = count_index(WAZUH_ALERTS)
+rba_count = count_index(ALERT_INDEX)
+reduction = 0.0 if raw_count == 0 else (1.0 - (rba_count / raw_count)) * 100.0
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Raw Wazuh alerts", f"{raw_count}")
+k2.metric("RBA alerts", f"{rba_count}")
+k3.metric("Alert reduction", f"{reduction:.1f}%")
+k4.metric("Time window", f"Last {hours}h")
+
+st.divider()
+st.subheader("Alert volume over time (raw vs RBA)")
+
+c1, c2 = st.columns(2)
+with c1:
+    interval = st.selectbox("Bucket size (minutes)", [1, 5, 10, 30], index=1)
+
+raw_ts = fetch_counts_timeseries(WAZUH_ALERTS, interval_minutes=int(interval))
+rba_ts = fetch_counts_timeseries(ALERT_INDEX, interval_minutes=int(interval))
+
+if raw_ts.empty and rba_ts.empty:
+    st.info("No data found for this time window.")
+else:
+    raw_ts = raw_ts.rename(columns={"count": "raw_alerts"})
+    rba_ts = rba_ts.rename(columns={"count": "rba_alerts"})
+    df_ts = pd.merge(raw_ts, rba_ts, on="ts", how="outer").fillna(0).sort_values("ts")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_ts["ts"], y=df_ts["raw_alerts"], mode="lines+markers", name="Raw Wazuh alerts"))
+    fig.add_trace(go.Scatter(x=df_ts["ts"], y=df_ts["rba_alerts"], mode="lines+markers", name="RBA alerts"))
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---- Main layout ----
+left, right = st.columns([1.2, 1])
+
+with left:
+    st.subheader("Top entities (risk profiling)")
+    df_state = fetch_entity_state(limit=topn)
+    if df_state.empty:
+        st.warning("No entity state data found yet.")
+    else:
+        df_state["status"] = df_state.apply(lambda r: "Above θ" if r["risk"] >= r["threshold"] else "Below θ", axis=1)
+        st.dataframe(df_state, use_container_width=True)
+
+        st.subheader("Risk vs Threshold (Top entities)")
+        fig_bar = px.bar(
+            df_state.sort_values("risk", ascending=False),
+            x="entity_name",
+            y=["risk", "threshold"],
+            barmode="group",
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+with right:
+    # --- 1) Explainable alerts FIRST (so we can drive the timeline selection) ---
+    st.subheader("Latest RBA alerts (explainable)")
+    df_alerts = fetch_rba_alerts(limit=50)
+
+    alert_entity_id = None
+    alert_ts = None
+
+    if df_alerts.empty:
+        st.info("No RBA alerts found in this time window.")
+    else:
+        df_show = df_alerts.copy()
+        df_show["ts_str"] = df_show["ts"].dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        df_show["label"] = df_show.apply(
+            lambda r: f'{r["ts_str"]} | {r["entity_name"]} ({r["entity_id"]}) | risk {r["risk"]:.2f} | θ {r["threshold"]:.2f}',
+            axis=1,
+        )
+
+        sel_label = st.selectbox("Select RBA alert", df_show["label"].tolist(), index=0, key="alert_select")
+        sel = df_show[df_show["label"] == sel_label].iloc[0]
+
+        alert_entity_id = sel["entity_id"]
+        alert_ts = sel["ts"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Risk", f'{sel["risk"]:.2f}')
+        m2.metric("Threshold (θ)", f'{sel["threshold"]:.2f}')
+        m3.metric("ΔRisk", f'{sel["delta_risk"]:.2f}')
+        m4.metric("Explain window", f'{int(sel.get("contributors_rules_window_hours") or hours)}h')
+
+        st.markdown(f'**Entity:** {sel["entity_name"]} (`{sel["entity_id"]}`)')
+
+        contrib = sel.get("contributors_rules") or []
+        if not contrib:
+            st.warning("No contributors_rules found in this alert doc (field missing or empty).")
+        else:
+            dfc = pd.DataFrame(contrib)
+            cols = [c for c in ["rule_id", "count", "max_level", "score", "description", "groups", "agent_name"] if c in dfc.columns]
+            st.dataframe(dfc[cols], use_container_width=True)
+
+            if "rule_id" in dfc.columns and "score" in dfc.columns:
+                dfp = dfc.copy()
+                dfp["rule_id"] = dfp["rule_id"].astype(str)
+                dfp = dfp.sort_values("score", ascending=False)
+
+                figc = go.Figure()
+                figc.add_trace(go.Bar(x=dfp["rule_id"], y=dfp["score"]))
+                figc.update_layout(
+                    title="Top contributing rules (score = count × max_level)",
+                    xaxis_title="rule_id",
+                    yaxis_title="score",
+                    height=350,
+                )
+                st.plotly_chart(figc, use_container_width=True)
+
+            with st.expander("Raw contributors_rules JSON"):
+                st.json(contrib)
+
+    st.divider()
+
+    # --- 2) Entity timeline SECOND (auto-select entity from chosen alert) ---
+    st.subheader("Entity risk timeline (decay + dynamic θ)")
+    if df_state.empty:
+        st.info("Run the RBA engine at least once to populate snapshots.")
+    else:
+        entity_options = (df_state["entity_id"] + " | " + df_state["entity_name"]).tolist()
+
+        default_id = alert_entity_id if alert_entity_id else df_state.iloc[0]["entity_id"]
+        default_index = 0
+        for i, opt in enumerate(entity_options):
+            if opt.startswith(default_id + " |"):
+                default_index = i
+                break
+
+        selected = st.selectbox("Select entity", entity_options, index=default_index, key="entity_select")
+        selected_id = selected.split(" | ")[0].strip()
+
+        df_snap = fetch_snapshots(selected_id)
+        if df_snap.empty:
+            st.warning("No snapshots found for this entity in the selected time window.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_snap["ts"], y=df_snap["risk"], mode="lines+markers", name="Risk"))
+            fig.add_trace(go.Scatter(x=df_snap["ts"], y=df_snap["threshold"], mode="lines", name="Threshold (θ)"))
+
+            if alert_ts is not None and alert_entity_id == selected_id:
+                fig.add_vline(
+                    x=alert_ts,
+                    line_dash="dash",
+                    annotation_text="RBA alert",
+                    annotation_position="top right",
+                )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+st.caption("RBA = entity-centric risk aggregation + exponential decay + adaptive thresholding + risk-velocity gating.")
